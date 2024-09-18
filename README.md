@@ -12,6 +12,7 @@ pip install py-cpuinfo
 pip install pywin32
 pip install setuptools
 pip install distutils
+pip install --upgrade setuptools
 
 Note: This program requires OpenHardwareMonitor to be running on your system. You can download it from their website at the following link:
 
