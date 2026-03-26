@@ -1,91 +1,180 @@
 import sys
 import time
-import cpuinfo
 import wmi
 import GPUtil
 import pythoncom
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
-from PyQt5.QtGui import QPainter, QColor, QBrush, QFont
+import pywintypes
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QPainter, QColor, QBrush, QFont, QPen
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QMenu, QAction
 
+
+# ---------------- TEMPERATURE THREAD ----------------
 class TemperatureThread(QThread):
-    temperature_signal = pyqtSignal(float, float)
-    
+    temperature_signal = pyqtSignal(object, object)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
     def run(self):
-        # Initialize COM for this thread
         pythoncom.CoInitialize()
-        
-        while True:
+
+        try:
+            w = wmi.WMI(namespace=r"root\OpenHardwareMonitor")
+        except:
+            w = None
+
+        while self.running:
+            cpu_temperature = None
+            gpu_temperature = None
+
             try:
-                # Get CPU temperature using wmi
-                w = wmi.WMI(namespace="root\OpenHardwareMonitor")
-                temperature_infos = w.Sensor()
-                cpu_temperatures = [x for x in temperature_infos if x.SensorType==u'Temperature' and 'CPU' in x.Name]
+                # CPU
+                if w:
+                    sensors = w.Sensor()
+                    cpu_temps = []
 
-                if len(cpu_temperatures) == 0:
-                    cpu_temperature = None
-                else:
-                    temperature = cpu_temperatures[0].Value
-                    cpu_temperature = float(temperature)
+                    for s in sensors:
+                        if s.SensorType != 'Temperature':
+                            continue
 
-                # Get GPU temperature using GPUtil
-                gpu = GPUtil.getGPUs()[0]
-                gpu_temperature = gpu.temperature
+                        name = s.Name.lower()
 
-                # Emit signal with temperature values
-                self.temperature_signal.emit(cpu_temperature, gpu_temperature)
-                
+                        if 'gpu' in name:
+                            continue
+
+                        # prioritize real CPU sensors
+                        if any(x in name for x in ['cpu', 'core', 'package']):
+                            cpu_temps.append(s.Value)
+
+                    # fallback if nothing matched
+                    if not cpu_temps:
+                        cpu_temps = [
+                            s.Value for s in sensors
+                            if s.SensorType == 'Temperature' and 'gpu' not in s.Name.lower()
+                        ]
+
+                    # ✅ THIS IS WHAT YOU WERE MISSING
+                    if cpu_temps:
+                        cpu_temperature = sum(cpu_temps) / len(cpu_temps)
+
+                # GPU
+                try:
+                    gpus = GPUtil.getGPUs()
+                    if gpus:
+                        gpu_temperature = gpus[0].temperature
+                except:
+                    pass
+
             except Exception as e:
                 print(f"Error retrieving temperatures: {e}")
-                
+
+            self.temperature_signal.emit(cpu_temperature, gpu_temperature)
             time.sleep(1)
-        
+
+    def stop(self):
+        self.running = False
+
+
+# ---------------- MAIN WINDOW ----------------
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        
-        # Set window attributes
+
+        self.cpu_temp = None
+        self.gpu_temp = None
+
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        
-        # Set font for labels
-        font = QFont()
-        font.setPointSize(12)
-        font.setBold(True)
-        
-        # Create labels for CPU and GPU temperature
-        self.cpu_label = QLabel(self)
-        self.cpu_label.setText("CPU: ")
+
+        font = QFont("Segoe UI", 12, QFont.Bold)
+
+        self.cpu_label = QLabel("CPU: --", self)
         self.cpu_label.setFont(font)
-        self.cpu_label.setStyleSheet("color: #c90f02;")
-        
-        self.gpu_label = QLabel(self)
-        self.gpu_label.setText("GPU: ")
+
+        self.gpu_label = QLabel("GPU: --", self)
         self.gpu_label.setFont(font)
-        self.gpu_label.setStyleSheet("color: #c90f02;")
-        
-        # Create a layout and add the labels to it
+
         layout = QVBoxLayout()
         layout.addWidget(self.cpu_label)
         layout.addWidget(self.gpu_label)
         layout.setContentsMargins(20, 20, 20, 20)
         self.setLayout(layout)
-        
-        # Set up temperature thread to update the labels
-        self.temperature_thread = TemperatureThread()
-        self.temperature_thread.temperature_signal.connect(self.update_temperature)
-        self.temperature_thread.start()
-        
-        # Initialize variables for window dragging
+
+        self.thread = TemperatureThread()
+        self.thread.temperature_signal.connect(self.update_temperature)
+        self.thread.start()
+
         self.dragging = False
         self.offset = None
 
-       # Set the initial position of the window to the top right corner of the screen
-        desktop = QApplication.desktop()
-        x = 2440#desktop.width() - 100
-        y = 0
-        self.move(x, y)
-        
+        screen = QApplication.primaryScreen().geometry()
+        self.move(screen.width() - 200, 0)
+
+    # ---------------- COLOR LOGIC ----------------
+    def get_color(self, temp):
+        if temp is None:
+            return QColor(200, 200, 200)
+
+        if temp < 50:
+            return QColor(0, 255, 100)     # green
+        elif temp < 80:
+            return QColor(255, 170, 0)     # orange
+        else:
+            return QColor(255, 50, 50)     # red
+
+    def is_overheating(self):
+        return (
+            (self.cpu_temp and self.cpu_temp > 85) or
+            (self.gpu_temp and self.gpu_temp > 85)
+        )
+
+    # ---------------- UPDATE UI ----------------
+    def update_temperature(self, cpu, gpu):
+        self.cpu_temp = cpu
+        self.gpu_temp = gpu
+
+        # CPU
+        if cpu is None:
+            self.cpu_label.setText("CPU: N/A")
+        else:
+            self.cpu_label.setText(f"CPU: {cpu:.1f}°C")
+
+        # GPU
+        if gpu is None:
+            self.gpu_label.setText("GPU: N/A")
+        else:
+            self.gpu_label.setText(f"GPU: {gpu:.1f}°C")
+
+        # Apply colors
+        self.cpu_label.setStyleSheet(f"color: {self.get_color(cpu).name()};")
+        self.gpu_label.setStyleSheet(f"color: {self.get_color(gpu).name()};")
+
+        self.update()  # repaint for glow
+
+    # ---------------- GLOW EFFECT ----------------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(2, 2, -2, -2)
+
+        if self.is_overheating():
+            # Glow effect
+            for i in range(8, 0, -1):
+                alpha = 20 + i * 15
+                pen = QPen(QColor(255, 0, 0, alpha), i)
+                painter.setPen(pen)
+                painter.drawRoundedRect(rect, 12, 12)
+        else:
+            # Normal border
+            pen = QPen(QColor(0, 0, 0, 150), 2)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(255, 0, 0, 10)))
+            painter.drawRoundedRect(rect, 12, 12)
+
+    # ---------------- DRAG + MENU ----------------
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
             menu = QMenu(self)
@@ -96,75 +185,27 @@ class MainWindow(QWidget):
         elif event.button() == Qt.LeftButton:
             self.dragging = True
             self.offset = event.pos()
-            
+
     def mouseMoveEvent(self, event):
         if self.dragging:
             self.move(self.mapToGlobal(event.pos() - self.offset))
-            
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.dragging = False
 
-    def paintEvent(self, event):
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-
-            # Set the pen color and style for the box
-            pen_color = QColor(0, 0, 0, 150)  # Red color with alpha value (transparency) 0,0,0 is color 150 is transparency
-            pen_width = 2 # changes border thickness
-            pen = painter.pen()
-            pen.setWidth(pen_width)
-            pen.setColor(pen_color)
-            painter.setPen(pen)
-
-            # Set the brush color and style for the box
-            brush_color = QColor(255, 0, 0, 2)  # Red color with alpha value (transparency) 255,0,0 is color 2 is transparency
-            brush = QBrush(brush_color)
-            painter.setBrush(brush)
-
-            # Draw the box around the window
-            rect = self.rect().adjusted(pen_width, pen_width, -pen_width, -pen_width)
-            painter.drawRect(rect)
+    def closeEvent(self, event):
+        self.thread.stop()
+        self.thread.wait()
+        event.accept()
 
 
-    def update_temperature(self, cpu_temperature, gpu_temperature):
-        # Update CPU label
-        if cpu_temperature is None:
-            self.cpu_label.setText("CPU Temperature: Not Available")
-        else:
-            self.cpu_label.setText(f"CPU: {cpu_temperature}°C")
-        
-        # Update GPU label
-        self.gpu_label.setText(f"GPU: {gpu_temperature}°C")
-        
+# ---------------- RUN APP ----------------
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    
-    # Set application style
     app.setStyle("Fusion")
-    
-    # Set dark mode color palette
-    dark_palette = app.palette()
-    dark_palette.setColor(dark_palette.Window, Qt.black)
-    dark_palette.setColor(dark_palette.WindowText, Qt.white)
-    dark_palette.setColor(dark_palette.ToolTipBase, Qt.white)
-    dark_palette.setColor(dark_palette.ToolTipText, Qt.white)
-    dark_palette.setColor(dark_palette.Text, Qt.white)
-    dark_palette.setColor(dark_palette.Button, Qt.darkGray)
-    dark_palette.setColor(dark_palette.ButtonText, Qt.white)
-    dark_palette.setColor(dark_palette.BrightText, Qt.red)
-    dark_palette.setColor(dark_palette.Link, Qt.blue)
-    dark_palette.setColor(dark_palette.Highlight, Qt.blue)
-    dark_palette.setColor(dark_palette.HighlightedText, Qt.white)
-    app.setPalette(dark_palette)
-    
-    # Set application font
-    font = QFont()
-    font.setFamily("Segoe UI")
-    font.setPointSize(10)
-    app.setFont(font)
-    
+
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
 
+    sys.exit(app.exec_())
